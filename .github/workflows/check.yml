@@ -3,7 +3,7 @@ name: BFL size watch
 on:
   schedule:
     # 18:00 Riyadh time (UTC+3) = 15:00 UTC. Change if you like.
-    - cron: "0 15 * * *"
+    - cron: "0 5,17 * * *"
   workflow_dispatch:        # lets you run it manually from the Actions tab
     inputs:
       mode:
