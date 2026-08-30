@@ -56,9 +56,27 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", '
+                 '"Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Cache-Control": "max-age=0",
+    "Connection": "keep-alive",
 }
+
+# TLS fingerprint to imitate. Only used when curl_cffi is installed.
+IMPERSONATE = os.environ.get("BFL_IMPERSONATE", "chrome124")
 
 # Class-name fragments that mark a size chip as NOT buyable.
 # Calibrate these once with --calibrate (see README).
@@ -96,17 +114,61 @@ PRODUCT_URL_RE = re.compile(r"/en-sa/([a-z0-9\-]+)/(\d+)/p/", re.I)
 # HTTP
 # --------------------------------------------------------------------------
 
-def fetch(url: str, session: requests.Session, tries: int = 3) -> str:
+class BlockedError(RuntimeError):
+    """Raised when the site refuses us outright."""
+
+
+def make_session():
+    """Prefer curl_cffi (mimics a real Chrome TLS handshake). Fall back to
+    plain requests if it isn't installed."""
+    try:
+        from curl_cffi import requests as cffi  # type: ignore
+        s = cffi.Session(impersonate=IMPERSONATE)
+        s.headers.update(HEADERS)
+        return s, "curl_cffi"
+    except Exception:  # noqa: BLE001
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        return s, "requests"
+
+
+def warm_up(session) -> None:
+    """Visit the homepage first so we pick up cookies, like a browser would."""
+    try:
+        session.get(f"{BASE}/en-sa/", timeout=TIMEOUT)
+        time.sleep(1.0)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[note] warm-up request failed: {exc}", file=sys.stderr)
+
+
+def fetch(url: str, session, tries: int = 3, referer: str | None = None) -> str:
+    headers = dict(HEADERS)
+    if referer:
+        headers["Referer"] = referer
+        headers["Sec-Fetch-Site"] = "same-origin"
+
     last = None
     for attempt in range(tries):
         try:
-            r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+            r = session.get(url, headers=headers, timeout=TIMEOUT)
+            if r.status_code == 403:
+                last = f"403 Forbidden (blocked, attempt {attempt + 1})"
+                time.sleep(3 * (attempt + 1))
+                continue
+            if r.status_code == 429:
+                last = "429 rate limited"
+                time.sleep(10 * (attempt + 1))
+                continue
             r.raise_for_status()
             return r.text
         except Exception as exc:  # noqa: BLE001
             last = exc
             time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"Failed to fetch {url}: {last}")
+
+    raise BlockedError(f"Failed to fetch {url}: {last}")
+
+
+
 
 
 # --------------------------------------------------------------------------
@@ -417,16 +479,33 @@ def main() -> int:
     ap.add_argument("--force-notify", action="store_true", help="ignore saved state")
     args = ap.parse_args()
 
-    session = requests.Session()
+    session, kind = make_session()
 
     if args.calibrate:
+        warm_up(session)
         calibrate(args.calibrate, session)
         return 0
 
+    print(f"Client : {kind} (impersonate={IMPERSONATE})")
     print(f"Search : {SEARCH_URL}")
     print(f"Sizes  : {', '.join(TARGET_SIZES)}")
 
-    listing = fetch(SEARCH_URL, session)
+    warm_up(session)
+    try:
+        listing = fetch(SEARCH_URL, session, referer=f"{BASE}/en-sa/")
+    except BlockedError as exc:
+        print(f"\n[BLOCKED] {exc}", file=sys.stderr)
+        print(
+            "\nThe site refused this machine. This usually means it is blocking\n"
+            "datacenter IP addresses (GitHub Actions runs on Microsoft Azure).\n"
+            "Things to try, in order:\n"
+            "  1. pip install curl_cffi   (mimics a real Chrome TLS handshake)\n"
+            "  2. Try another fingerprint: BFL_IMPERSONATE=chrome131 or safari17_0\n"
+            "  3. Run the script on your own computer instead - home internet\n"
+            "     connections are not blocked. See the README.\n",
+            file=sys.stderr,
+        )
+        return 2
     products = find_products(listing)
     print(f"Found  : {len(products)} product(s)\n")
 
@@ -441,7 +520,7 @@ def main() -> int:
     for p in products:
         time.sleep(REQUEST_DELAY)
         try:
-            html = fetch(p["url"], session)
+            html = fetch(p["url"], session, referer=SEARCH_URL)
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] {p['id']}: {exc}", file=sys.stderr)
             continue
