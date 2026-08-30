@@ -1,0 +1,69 @@
+name: BFL size watch
+
+on:
+  schedule:
+    # 06:00 Riyadh time (UTC+3) = 03:00 UTC. Change if you like.
+    - cron: "0 3 * * *"
+  workflow_dispatch:        # lets you run it manually from the Actions tab
+    inputs:
+      mode:
+        description: "How to run it"
+        required: true
+        default: "debug (just show what it finds, send nothing)"
+        type: choice
+        options:
+          - "debug (just show what it finds, send nothing)"
+          - "test alert (send a message even if nothing is new)"
+          - "normal"
+
+permissions:
+  contents: write           # needed so it can save state.json back to the repo
+
+concurrency:
+  group: bfl-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check stock
+        env:
+          BFL_SEARCH_URL: "https://www.brandsforless.com/en-sa/search/?p_cat=men&q=ralph+lauren"
+          BFL_TARGET_SIZES: "M"
+          DISCORD_WEBHOOK_URL: ${{ secrets.https://discord.com/api/webhooks/1543708414503288884/KIKgyr52BZeh2dJgGWlnVlxUHwwemZ6Djrc4fLx8x8usPWFUb4aFwbx4E3MDEHZfRkP9 }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: |
+          case "${{ inputs.mode }}" in
+            debug*)  FLAG="--debug" ;;
+            test*)   FLAG="--force-notify" ;;
+            *)       FLAG="" ;;
+          esac
+          python bfl_watch.py $FLAG
+
+      - name: Save state
+        run: |
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "update state [skip ci]"
+            git push
+          else
+            echo "no state change"
+          fi
