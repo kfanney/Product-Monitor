@@ -53,7 +53,7 @@ jobs:
         run: |
           case "${{ inputs.mode }}" in
             debug*)  FLAG="--debug" ;;
-            test*)   FLAG="--force-notify" ;;
+            test*)   FLAG="--force-notify --test-webhook" ;;
             *)       FLAG="" ;;
           esac
           python bfl_watch.py $FLAG
