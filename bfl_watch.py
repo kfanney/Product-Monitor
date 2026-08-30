@@ -587,6 +587,9 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="print detail, send nothing")
     ap.add_argument("--calibrate", metavar="URL", help="dump size markup for one product")
     ap.add_argument("--force-notify", action="store_true", help="ignore saved state")
+    ap.add_argument("--test-webhook", action="store_true",
+                    help="send a message even when nothing matches, to prove "
+                         "the notifier works")
     args = ap.parse_args()
 
     session, kind = make_session()
@@ -599,6 +602,9 @@ def main() -> int:
     route = f"scrape.do proxy (geo={GEO_CODE or 'auto'})" if SCRAPEDO_TOKEN \
         else f"direct - {kind} (impersonate={IMPERSONATE})"
     print(f"Route  : {route}")
+    if not SCRAPEDO_TOKEN:
+        print("[warn] SCRAPEDO_TOKEN is not set. Going direct, which Brands "
+              "For Less blocks from servers. Expect a 403.")
     print(f"Search : {SEARCH_URL}")
     print(f"Sizes  : {', '.join(TARGET_SIZES)}")
 
@@ -607,16 +613,30 @@ def main() -> int:
         listing = fetch(SEARCH_URL, session, referer=f"{BASE}/en-sa/")
     except BlockedError as exc:
         print(f"\n[BLOCKED] {exc}", file=sys.stderr)
-        print(
-            "\nThe site refused this machine. This usually means it is blocking\n"
-            "datacenter IP addresses (GitHub Actions runs on Microsoft Azure).\n"
-            "Things to try, in order:\n"
-            "  1. pip install curl_cffi   (mimics a real Chrome TLS handshake)\n"
-            "  2. Try another fingerprint: BFL_IMPERSONATE=chrome131 or safari17_0\n"
-            "  3. Run the script on your own computer instead - home internet\n"
-            "     connections are not blocked. See the README.\n",
-            file=sys.stderr,
-        )
+        if SCRAPEDO_TOKEN:
+            print(
+                "\nEven the proxy could not fetch the page. Check your credit\n"
+                "balance at https://dashboard.scrape.do and that the token is\n"
+                "still valid.\n",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "\n>>> SCRAPEDO_TOKEN is NOT SET, so the request went direct <<<\n"
+                "\nThat is why it failed. Brands For Less blocks datacenter IPs\n"
+                "and GitHub Actions runs on Microsoft Azure. No amount of header\n"
+                "or TLS faking gets around it.\n\n"
+                "Fix:\n"
+                "  1. Sign up free at https://dashboard.scrape.do/sign-up\n"
+                "  2. Copy your API token from the dashboard\n"
+                "  3. In this repo: Settings > Secrets and variables > Actions\n"
+                "     > New repository secret\n"
+                "       Name:   SCRAPEDO_TOKEN\n"
+                "       Secret: <paste the token>\n"
+                "  4. Run this workflow again. The first line should say\n"
+                "     'Route  : scrape.do proxy', not 'direct'.\n",
+                file=sys.stderr,
+            )
         return 2
     products = parse_listing(listing)
     print(f"Found  : {len(products)} product(s)")
@@ -698,11 +718,47 @@ def main() -> int:
             del state[key]
 
     if not fresh:
+        if args.test_webhook:
+            lines = [
+                "✅ Test message — your Brands For Less watcher is working.",
+                "",
+                f"Watching for size {'/'.join(TARGET_SIZES)}. "
+                f"Nothing matches right now. Currently in stock:",
+                "",
+            ]
+            for p in products:
+                lines.append(f"• {p['title']} — {', '.join(p['sizes']) or 'none'}")
+            lines += ["", "You'll get a message here when something appears in "
+                          f"{'/'.join(TARGET_SIZES)}."]
+            body = "\n".join(lines)
+            print("\n" + body)
+
+            sent = any([
+                notify_discord(body),
+                notify_telegram(body),
+                notify_email("Brands For Less watcher test", body),
+            ])
+            if not sent:
+                print(
+                    "\n[FAIL] Nothing was sent. No notifier is configured, or "
+                    "the webhook was rejected.\n"
+                    "  - Is there a secret named exactly DISCORD_WEBHOOK_URL?\n"
+                    "  - Does check.yml have the line\n"
+                    "      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}\n"
+                    "  - Is the webhook still alive in Discord?",
+                    file=sys.stderr,
+                )
+                save_state(state)
+                return 3
+            print("\n[OK] Test message sent. Check your Discord channel.")
+            save_state(state)
+            return 0
+
         print("\nNo new matches.")
         save_state(state)
         return 0
 
-    lines = [f" {len(fresh)} Ralph Lauren item(s) available in "
+    lines = [f"👕 {len(fresh)} Ralph Lauren item(s) available in "
              f"{'/'.join(TARGET_SIZES)}:", ""]
     for p in fresh:
         lines.append(f"• {p['title']}")
