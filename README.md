@@ -1,109 +1,134 @@
-# Brands For Less — size watcher
+# Brands For Less size watcher
 
-Checks the BFL men's Ralph Lauren search page once a day, opens every product,
-and messages you when any of them has size **M** in stock.
-
-Runs free on GitHub Actions. Nothing to leave switched on.
+Checks a BFL search page once a day and messages you on Discord when a product
+appears in your size. Runs on GitHub's free servers. Your computer stays off.
 
 ---
 
-## 1. Local test first (5 minutes)
+## Why there's a proxy in here
 
-```bash
-pip install -r requirements.txt
-python bfl_watch.py --debug
+Brands For Less blocks requests coming from datacenter IP addresses, and GitHub
+Actions runs on Microsoft Azure. A plain request gets 403 Forbidden no matter
+what headers it sends. So the request is routed through Scrape.do, which
+forwards it from a Saudi residential IP that the site accepts.
+
+Scrape.do's free plan is 1,000 credits a month, no credit card. This script
+uses about **30 a month**, because it reads every product's sizes straight off
+the search results page in a single request. It only opens an individual
+product page to double-check when something actually matches your size.
+
+---
+
+## Setup
+
+### 1. Get a Scrape.do token
+Sign up at https://dashboard.scrape.do/sign-up (free, no card). Copy the API
+token from your dashboard.
+
+### 2. Get a Discord webhook
+In Discord: Server Settings > Integrations > Webhooks > New Webhook. Pick a
+channel, then Copy Webhook URL. Webhooks can't post to DMs, so if you want this
+private, make a server with only yourself in it.
+
+### 3. Add both to GitHub
+In your repo: Settings > Secrets and variables > Actions > New repository
+secret. Add these two, exactly as named:
+
+| Name | Value |
+|---|---|
+| `SCRAPEDO_TOKEN` | your Scrape.do API token |
+| `DISCORD_WEBHOOK_URL` | your Discord webhook URL |
+
+The workflow file refers to these by name. Never paste the values into
+`check.yml` - anything in that file is stored in plain text.
+
+### 4. Test it
+Actions tab > BFL size watch > Run workflow > leave mode on **debug** > green
+Run workflow button. Open the run, then the "Check stock" step.
+
+You want to see:
+
+```
+Route  : scrape.do proxy (geo=sa)
+Found  : 5 product(s)
+
+- Polo Ralph Lauren Men Regular Fit Drawstring Jogger Pants, Grey
+    in stock: XS
+...
+Scrape.do credits used this run: ~1
 ```
 
-`--debug` prints what it found and sends nothing. Expected output today, since
-none of the 5 items has M:
+No M anywhere right now, so it should report no matches. Then run it again on
+**test alert** to confirm Discord works.
 
-```
-- Polo Ralph Lauren Men Crew Neck Cable Knitted Sweaters, Red
-    all: S, M, L, XL, 2XL
-    in stock: 2XL
-```
+After that it runs itself, daily at 03:00 UTC (06:00 Riyadh).
 
-**This is the important check.** If `in stock` lists *every* size for a product,
-the script isn't seeing the out-of-stock markers, and you'd get false alarms.
-The script warns you when it detects this. Fix it with:
-
-```bash
-python bfl_watch.py --calibrate "https://www.brandsforless.com/en-sa/polo-ralph-lauren-men-crew-neck-cable-knitted-sweaters-red/1384415/p/"
-```
-
-That prints each size chip with its CSS classes. This product is known to have
-only 2XL in stock, so it's a good reference. Whatever class marks S/M/L/XL,
-add it to `BFL_UNAVAILABLE_HINTS` (comma separated, matched as substrings).
-
-## 2. Discord alerts (easiest)
-
-1. In Discord: **Server Settings → Integrations → Webhooks → New Webhook**.
-   Pick the channel you want the alerts in.
-   (For a DM-style ping, make a private server with just you — webhooks can't
-   post to DMs.)
-2. Click **Copy Webhook URL**.
-
-```bash
-export DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/...'
-python bfl_watch.py --force-notify   # should post in the channel
-```
-
-That's it — no bot, no OAuth. Treat the URL like a password: anyone holding it
-can post to that channel, which is why it goes in GitHub Secrets below and not
-in the workflow file.
-
-To get a phone notification, right-click the channel → **Notification
-Settings → All Messages**.
-
-### Telegram instead
-
-1. Message **@BotFather**, send `/newbot`, copy the token.
-2. Send your new bot any message.
-3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy `chat.id`.
-
-Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
-
-### Email instead
-Set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `ALERT_EMAIL_TO`.
-For Gmail use an App Password, not your normal password.
-
-Any combination works — set all three and it sends to all three.
-
-## 3. Put it on GitHub
-
-1. Create a **private** repo, push these files.
-2. Settings → Secrets and variables → Actions → add `DISCORD_WEBHOOK_URL`
-   (and/or the Telegram / SMTP ones).
-3. Actions tab → *BFL size watch* → **Run workflow** to test it now.
-
-It then runs daily at 03:00 UTC (06:00 Riyadh). Change the `cron:` line in
-`.github/workflows/check.yml` to move it.
+---
 
 ## Settings
 
-| Variable | Default | Notes |
+Edit the `env:` block in `.github/workflows/check.yml`:
+
+| Variable | Default | What it does |
 |---|---|---|
-| `BFL_SEARCH_URL` | men + ralph lauren search | any BFL search/category URL works |
-| `BFL_TARGET_SIZES` | `M` | comma separated, e.g. `M,L` or `32 x 30` |
-| `BFL_UNAVAILABLE_HINTS` | `disable,sold,out-of-stock,...` | class fragments meaning sold out |
-| `BFL_REQUEST_DELAY` | `1.5` | seconds between product pages |
+| `BFL_SEARCH_URL` | men + ralph lauren | any BFL search or category URL |
+| `BFL_TARGET_SIZES` | `M` | comma separated, e.g. `M,L` |
+| `BFL_GEO` | `sa` | proxy country |
+| `BFL_UNAVAILABLE_HINTS` | disable,sold,... | class names meaning sold out |
+
+To watch something else, search on the site in your browser and paste the
+address bar into `BFL_SEARCH_URL`.
+
+Only the first page of results is checked. If the run warns that your search
+has multiple pages, narrow it with filters until it's one page.
+
+---
 
 ## How it decides
 
-The search listing shows only a *last-piece* size on each card, so it isn't a
-reliable list of what's available. The script instead opens each product page,
-reads the size selector, and treats a size as available unless its chip is
-marked disabled. `state.json` remembers what it already told you, so you get one
-alert per item, not one every morning. If an item stops matching, it's dropped
-from state, so a later restock alerts again.
+The search results page lists each product's in-stock sizes on the card. That
+one page answers the whole question, so a normal day is a single request. When
+a size matches, it opens that product's page to confirm before messaging you.
+
+`state.json` remembers what you've already been told, so you get one message
+per item rather than the same one every morning. If an item stops matching it's
+dropped from state, so a later restock alerts again.
+
+---
+
+## Credits
+
+Datacenter requests cost 1 credit, residential cost 10. The script tries
+datacenter first and only escalates if blocked; failed attempts are free. Each
+run prints what it used. Watch your balance at https://dashboard.scrape.do
+for the first week.
+
+At one run a day you should be at roughly 30-300 credits a month against a
+1,000 free allowance. If you ever run short, change the `cron` line to run
+every other day: `0 3 */2 * *`.
+
+---
 
 ## When it breaks
 
-BFL will redesign eventually. Symptoms and fixes:
+**"no products parsed"** - BFL changed its layout. Run in debug and send the
+output to Claude.
 
-- **"no products parsed"** — the product URL format changed. Check `PRODUCT_URL_RE`.
-- **"Every size looked available"** — run `--calibrate` and update the hints.
-- **Silent, but you know M exists** — run `--debug` and compare against the site.
+**Every product shows every size** - the sold-out marker changed. Run
+`python bfl_watch.py --calibrate "<a product URL>"` and update
+`BFL_UNAVAILABLE_HINTS`.
 
-Keep the delay at 1.5s or higher and don't lower the schedule below daily;
-this is a handful of polite requests, and there's no reason to make it more.
+**"Scrape.do rejected the token"** - `SCRAPEDO_TOKEN` is wrong or missing.
+
+**"out of credits"** - check the dashboard, or reduce the schedule.
+
+**403 Forbidden** - the proxy isn't being used. Confirm the first output line
+says `Route : scrape.do proxy`, not `direct`.
+
+---
+
+## Running it on your own PC instead
+
+If you'd rather not use a proxy service, the same script works from home,
+where the site isn't blocked. Leave `SCRAPEDO_TOKEN` unset and it goes direct.
+The Windows version with Task Scheduler is in the other folder.
