@@ -26,6 +26,7 @@ import sys
 import time
 from email.message import EmailMessage
 from pathlib import Path
+from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -50,6 +51,19 @@ STATE_FILE = Path(os.environ.get("BFL_STATE_FILE", "state.json"))
 REQUEST_DELAY = float(os.environ.get("BFL_REQUEST_DELAY", "1.5"))
 TIMEOUT = 30
 BASE = "https://www.brandsforless.com"
+
+# ---- Scrape.do proxy (lets this run on a server instead of your PC) ----
+# Sign up free at https://dashboard.scrape.do/sign-up and put the token in
+# the SCRAPEDO_TOKEN environment variable. Without it, requests go direct.
+SCRAPEDO_TOKEN = os.environ.get("SCRAPEDO_TOKEN", "").strip()
+GEO_CODE = os.environ.get("BFL_GEO", "sa").strip().lower()
+PROXY_TIMEOUT = int(os.environ.get("BFL_PROXY_TIMEOUT", "90"))
+PROXY_API = "https://api.scrape.do/"
+
+# Tier 0 = datacenter IP (1 credit). Tier 1 = residential/mobile (costs more).
+# Failed requests are not charged, so trying the cheap one first is free.
+_TIER = {"level": 0, "credits": 0}
+_TIER_COST = {0: 1, 1: 10}
 
 HEADERS = {
     "User-Agent": (
@@ -134,6 +148,8 @@ def make_session():
 
 def warm_up(session) -> None:
     """Visit the homepage first so we pick up cookies, like a browser would."""
+    if SCRAPEDO_TOKEN:
+        return  # proxy rotates IPs per request; a warm-up would just cost credits
     try:
         session.get(f"{BASE}/en-sa/", timeout=TIMEOUT)
         time.sleep(1.0)
@@ -141,7 +157,58 @@ def warm_up(session) -> None:
         print(f"[note] warm-up request failed: {exc}", file=sys.stderr)
 
 
+def _scrapedo_url(target: str, level: int) -> str:
+    params = {"token": SCRAPEDO_TOKEN, "url": target}
+    if GEO_CODE:
+        params["geoCode"] = GEO_CODE
+    if level >= 1:
+        params["super"] = "true"
+    return PROXY_API + "?" + urlencode(params)
+
+
+def _fetch_via_proxy(url: str, session, tries: int = 2) -> str:
+    """Fetch through scrape.do, escalating from datacenter to residential."""
+    last = None
+    for level in (_TIER["level"], 1):
+        for attempt in range(tries):
+            try:
+                r = session.get(_scrapedo_url(url, level), timeout=PROXY_TIMEOUT)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                time.sleep(2 * (attempt + 1))
+                continue
+
+            if r.status_code == 200:
+                if level != _TIER["level"]:
+                    print(f"  (switched to {'residential' if level else 'datacenter'} IPs)")
+                    _TIER["level"] = level
+                _TIER["credits"] += _TIER_COST[level]
+                return r.text
+
+            body = (r.text or "")[:200].replace("\n", " ")
+            if r.status_code in (401, 403) and "token" in body.lower():
+                raise BlockedError(
+                    "Scrape.do rejected the token. Check SCRAPEDO_TOKEN is "
+                    f"correct. Response: {body}"
+                )
+            if r.status_code == 429:
+                raise BlockedError(
+                    "Scrape.do says you are out of credits or too many "
+                    f"concurrent requests. Response: {body}"
+                )
+            last = f"HTTP {r.status_code}: {body}"
+            time.sleep(2 * (attempt + 1))
+
+        if level == 1:
+            break
+
+    raise BlockedError(f"Failed to fetch {url} via scrape.do: {last}")
+
+
 def fetch(url: str, session, tries: int = 3, referer: str | None = None) -> str:
+    if SCRAPEDO_TOKEN:
+        return _fetch_via_proxy(url, session)
+
     headers = dict(HEADERS)
     if referer:
         headers["Referer"] = referer
@@ -175,35 +242,78 @@ def fetch(url: str, session, tries: int = 3, referer: str | None = None) -> str:
 # Listing page -> product URLs
 # --------------------------------------------------------------------------
 
-def find_products(html: str) -> list[dict]:
-    """Return [{'id', 'slug', 'url'}] for every product linked on the page."""
-    seen: dict[str, dict] = {}
+def _pretty(slug: str) -> str:
+    return slug.replace("-", " ").title()
+
+
+def _card_sizes(node) -> list[str]:
+    """Letter sizes (and 32 x 30 style) inside one product card.
+
+    Bare numbers are deliberately ignored here: a card also contains the price,
+    and 'SAR 45' would otherwise be read as size 45.
+    """
+    out = []
+    for _tag, token, _text in _size_candidates(node):
+        if re.fullmatch(r"\d{2}(\.5)?", token):
+            continue  # bare number - almost certainly a price, not a size
+        if token not in out:
+            out.append(token)
+    return out
+
+
+def parse_listing(html: str) -> list[dict]:
+    """Every product on the search page, with the sizes shown as in stock."""
     soup = BeautifulSoup(html, "html.parser")
+    cards: dict[str, dict] = {}
 
     for a in soup.find_all("a", href=True):
         m = PRODUCT_URL_RE.search(a["href"])
         if not m:
             continue
         slug, pid = m.group(1), m.group(2)
-        if pid in seen:
+
+        sizes = _card_sizes(a)
+        if not sizes and a.parent is not None:
+            sizes = _card_sizes(a.parent)
+
+        img = a.find("img", alt=True)
+        title = (img["alt"].strip() if img and img["alt"].strip()
+                 else _pretty(slug))
+
+        price = ""
+        pm = re.search(r"SAR\s*[\d,]+", a.get_text(" ", strip=True))
+        if pm:
+            price = pm.group(0)
+
+        if pid in cards:
+            for s in sizes:
+                if s not in cards[pid]["sizes"]:
+                    cards[pid]["sizes"].append(s)
             continue
-        seen[pid] = {
+
+        cards[pid] = {
             "id": pid,
             "slug": slug,
             "url": f"{BASE}/en-sa/{slug}/{pid}/p/",
+            "title": title,
+            "price": price,
+            "sizes": sizes,
         }
 
-    # Fallback: some markup puts the link in an onclick / data attribute.
-    if not seen:
-        for m in PRODUCT_URL_RE.finditer(html):
-            slug, pid = m.group(1), m.group(2)
-            seen.setdefault(pid, {
-                "id": pid,
-                "slug": slug,
-                "url": f"{BASE}/en-sa/{slug}/{pid}/p/",
-            })
+    return list(cards.values())
 
-    return list(seen.values())
+
+def more_pages(html: str) -> str | None:
+    """Return e.g. '1/36' if the listing is paginated beyond page one."""
+    m = re.search(r"Page\s*(\d+)\s*/\s*(\d+)", html)
+    if m and m.group(2) != "1":
+        return f"{m.group(1)}/{m.group(2)}"
+    return None
+
+
+def find_products(html: str) -> list[dict]:
+    """Kept for the --calibrate path."""
+    return parse_listing(html)
 
 
 # --------------------------------------------------------------------------
@@ -486,7 +596,9 @@ def main() -> int:
         calibrate(args.calibrate, session)
         return 0
 
-    print(f"Client : {kind} (impersonate={IMPERSONATE})")
+    route = f"scrape.do proxy (geo={GEO_CODE or 'auto'})" if SCRAPEDO_TOKEN \
+        else f"direct - {kind} (impersonate={IMPERSONATE})"
+    print(f"Route  : {route}")
     print(f"Search : {SEARCH_URL}")
     print(f"Sizes  : {', '.join(TARGET_SIZES)}")
 
@@ -506,53 +618,64 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    products = find_products(listing)
-    print(f"Found  : {len(products)} product(s)\n")
+    products = parse_listing(listing)
+    print(f"Found  : {len(products)} product(s)")
+
+    pages = more_pages(listing)
+    if pages:
+        print(f"[note] this search has multiple pages ({pages}); only page 1 "
+              f"is checked. Narrow the search URL if that matters.")
 
     if not products:
-        print("[warn] no products parsed - the listing markup may have changed.",
+        print("\n[warn] no products parsed - the listing markup may have "
+              "changed. Run with --debug and send the output to Claude.",
               file=sys.stderr)
         return 1
 
+    print()
     matches = []
-    stock_signal_broken = False
-
     for p in products:
-        time.sleep(REQUEST_DELAY)
-        try:
-            html = fetch(p["url"], session, referer=SEARCH_URL)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[warn] {p['id']}: {exc}", file=sys.stderr)
-            continue
-
-        available, seen = parse_sizes(html)
-        if "__NO_STOCK_SIGNAL__" in seen:
-            stock_signal_broken = True
-            seen = [s for s in seen if s != "__NO_STOCK_SIGNAL__"]
-
-        p["title"] = product_title(html)
-        p["price"] = product_price(html)
-        p["available"] = available
-        p["all_sizes"] = seen
-
-        hit = [s for s in TARGET_SIZES if s in available]
+        hit = [s for s in TARGET_SIZES if s in p["sizes"]]
+        flag = "  <<< MATCH" if hit else ""
+        print(f"- {p['title'][:58]}")
+        print(f"    in stock: {', '.join(p['sizes']) or '(none shown)'}{flag}")
         if hit:
             p["hit"] = hit
             matches.append(p)
 
-        flag = "  <<< MATCH" if hit else ""
-        print(f"- {p['title'][:60]}")
-        print(f"    all: {', '.join(seen) or '-'}")
-        print(f"    in stock: {', '.join(available) or '-'}{flag}")
+    # Confirm each match on its own product page. Only runs when something
+    # actually matched, so a normal day costs a single request.
+    confirmed = []
+    for p in matches:
+        time.sleep(REQUEST_DELAY)
+        try:
+            html = fetch(p["url"], session, referer=SEARCH_URL)
+        except BlockedError as exc:
+            print(f"[note] could not double-check {p['id']}: {exc}",
+                  file=sys.stderr)
+            confirmed.append(p)      # trust the listing rather than stay silent
+            continue
 
-    if stock_signal_broken:
-        print(
-            "\n[warn] Every size looked available on at least one product. "
-            "The out-of-stock CSS class has probably changed. "
-            "Run: python bfl_watch.py --calibrate <product-url>  and update "
-            "BFL_UNAVAILABLE_HINTS.",
-            file=sys.stderr,
-        )
+        available, seen = parse_sizes(html)
+        if "__NO_STOCK_SIGNAL__" in seen:
+            confirmed.append(p)
+            continue
+
+        still = [s for s in p["hit"] if s in available]
+        if still:
+            p["hit"] = still
+            p["price"] = product_price(html) or p["price"]
+            confirmed.append(p)
+        else:
+            print(f"[note] {p['title'][:40]} showed "
+                  f"{'/'.join(p['hit'])} on the listing but not on the "
+                  f"product page - skipping.")
+
+    matches = confirmed
+    stock_signal_broken = False
+
+    if SCRAPEDO_TOKEN:
+        print(f"\nScrape.do credits used this run: ~{_TIER['credits']}")
 
     if args.debug:
         print("\n[debug] no notifications sent.")
@@ -579,7 +702,7 @@ def main() -> int:
         save_state(state)
         return 0
 
-    lines = [f"👕 {len(fresh)} Ralph Lauren item(s) available in "
+    lines = [f" {len(fresh)} Ralph Lauren item(s) available in "
              f"{'/'.join(TARGET_SIZES)}:", ""]
     for p in fresh:
         lines.append(f"• {p['title']}")
