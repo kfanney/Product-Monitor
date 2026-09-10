@@ -39,7 +39,7 @@ jobs:
       - name: Check stock
         env:
           BFL_SEARCH_URL: "https://www.brandsforless.com/en-sa/search/?p_cat=men&q=ralph+lauren"
-          BFL_TARGET_SIZES: "S,M"
+          BFL_TARGET_SIZES: "M"
           BFL_GEO: "sa"
           SCRAPEDO_TOKEN: ${{ secrets.SCRAPEDO_TOKEN }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
