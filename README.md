@@ -1,6 +1,6 @@
 # Brands For Less size watcher
 
-Checks a BFL search page once a day and messages you on Discord when a product
+Checks a BFL search page once a day (whenever you desire) and messages you on Discord when a product
 appears in your size. Runs on GitHub's free servers. Your computer stays off.
 
 ---
